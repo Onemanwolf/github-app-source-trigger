@@ -1,0 +1,38 @@
+name: Source - Result Receiver
+
+on:
+  # Receives the callback dispatched by the target's evaluator
+  repository_dispatch:
+    types: [cross-repo-result]
+
+permissions:
+  contents: read
+
+jobs:
+  report-result:
+    runs-on: ubuntu-latest
+    name: Report Cross-Repo Result
+
+    steps:
+      - name: Show result reported by target
+        run: |
+          CONCLUSION="${{ github.event.client_payload.conclusion }}"
+
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  Callback Received from Target Repo       ║"
+          echo "╚══════════════════════════════════════════╝"
+          echo "Target repo:       ${{ github.event.client_payload.target_repo }}"
+          echo "Receiver workflow: ${{ github.event.client_payload.workflow_name }}"
+          echo "Run:               #${{ github.event.client_payload.run_number }}"
+          echo "Run URL:           ${{ github.event.client_payload.run_url }}"
+          echo "Conclusion:        ${CONCLUSION}"
+          echo "Reported at:       ${{ github.event.client_payload.reported_at }}"
+          echo ""
+
+          if [ "$CONCLUSION" = "success" ]; then
+            echo "✅ Target processed the trigger successfully — round trip complete"
+          else
+            echo "❌ Target reported failure (conclusion: ${CONCLUSION})"
+            # Fail this run so the source repo surfaces the target's failure as red
+            exit 1
+          fi
