@@ -1,11 +1,11 @@
 name: Source - Cross-Repo Trigger (Sync)
 
-# Synchronous variant: dispatches the target, then BLOCKS in the same job until
-# the target's receiver run completes. Finishes green on success; fails the run
-# on any non-success conclusion.
+# Synchronous variant: dispatches the target, BLOCKS until the target's receiver
+# run completes, then downloads the receiver's result artifact to read data it
+# produced (e.g. the container name) back into THIS run.
 #
-# Requires the GitHub App to have "Actions: Read" permission (to poll target runs)
-# in addition to "Contents: Write" (to send the dispatch).
+# Requires the GitHub App to have "Actions: Read" (poll runs + download artifacts)
+# in addition to "Contents: Write" (send the dispatch).
 
 on:
   workflow_dispatch:
@@ -14,10 +14,14 @@ on:
         description: 'Target repository (owner/repo)'
         required: true
         default: 'Onemanwolf/github-app-target-receiver'
-      message:
-        description: 'Message to include with trigger'
+      container-name:
+        description: 'Container name to send to the target'
         required: false
-        default: 'Synchronous trigger'
+        default: 'api-server'
+      image-tag:
+        description: 'Image tag to send to the target'
+        required: false
+        default: 'v1.0.0'
       timeout-seconds:
         description: 'Max seconds to wait for the target run to finish'
         required: false
@@ -55,11 +59,13 @@ jobs:
           repositories: ${{ steps.parse.outputs.repo }}
 
       - name: Dispatch and wait for completion
+        id: wait
         uses: actions/github-script@v9
         env:
           TARGET_OWNER: ${{ steps.parse.outputs.owner }}
           TARGET_REPO: ${{ steps.parse.outputs.repo }}
-          MESSAGE: ${{ github.event.inputs.message }}
+          CONTAINER_NAME: ${{ github.event.inputs.container-name }}
+          IMAGE_TAG: ${{ github.event.inputs.image-tag }}
           TIMEOUT_SECONDS: ${{ github.event.inputs.timeout-seconds }}
           RECEIVER_WORKFLOW: target-receiver.yml
         with:
@@ -69,38 +75,32 @@ jobs:
             const repo = process.env.TARGET_REPO;
             const timeoutMs = (parseInt(process.env.TIMEOUT_SECONDS, 10) || 300) * 1000;
             const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-            // Unique correlation id for THIS source run (survives re-runs via attempt).
             const cid = `${context.runId}-${process.env.GITHUB_RUN_ATTEMPT || '1'}`;
             const startedAt = Date.now();
 
-            // 1) Fire the dispatch with the correlation id embedded in the payload.
+            // 1) Dispatch — send data DOWN to the receiver, plus the correlation id.
             await github.rest.repos.createDispatchEvent({
               owner, repo,
               event_type: 'cross-repo-trigger',
               client_payload: {
-                message: process.env.MESSAGE,
                 correlation_id: cid,
+                container_name: process.env.CONTAINER_NAME,
+                image_tag: process.env.IMAGE_TAG,
                 source_repo: `${context.repo.owner}/${context.repo.repo}`,
-                source_ref: context.ref,
                 triggered_by: context.actor,
-                run_id: context.runId,
                 timestamp: new Date().toISOString(),
               },
             });
-            core.info(`📤 Dispatched cross-repo-trigger (cid=${cid}) to ${owner}/${repo}`);
+            core.info(`📤 Dispatched (cid=${cid}) container=${process.env.CONTAINER_NAME}:${process.env.IMAGE_TAG} to ${owner}/${repo}`);
 
-            // 2) Poll until the matching receiver run appears AND completes.
-            core.info('⏳ Waiting for the target receiver run to appear and complete...');
+            // 2) Poll for the matching receiver run until it completes.
+            core.info('⏳ Waiting for the target receiver run...');
             const deadline = startedAt + timeoutMs;
             let target = null;
-
             while (Date.now() < deadline) {
               const runs = await github.rest.actions.listWorkflowRuns({
-                owner, repo,
-                workflow_id: process.env.RECEIVER_WORKFLOW,
-                event: 'repository_dispatch',
-                per_page: 30,
+                owner, repo, workflow_id: process.env.RECEIVER_WORKFLOW,
+                event: 'repository_dispatch', per_page: 30,
               });
               const match = runs.data.workflow_runs.find(r =>
                 (r.display_title && r.display_title.includes(cid)) ||
@@ -115,21 +115,41 @@ jobs:
               await sleep(5000);
             }
 
-            // 3) Decide the outcome of THIS run based on the target's conclusion.
+            // 3) Surface the result; expose run id for the artifact download step.
             if (!target) {
               core.setFailed(`❌ Timed out after ${timeoutMs / 1000}s waiting for target run (cid=${cid}).`);
               return;
             }
-
-            core.info(`🔗 Target run: ${target.html_url}`);
-            core.info(`   Conclusion: ${target.conclusion}`);
-
-            if (target.conclusion === 'success') {
-              core.info('✅ Target completed successfully — source run finishes green.');
-            } else {
+            core.setOutput('run_id', String(target.id));
+            core.setOutput('conclusion', target.conclusion);
+            core.info(`🔗 Target run: ${target.html_url} — conclusion: ${target.conclusion}`);
+            if (target.conclusion !== 'success') {
               core.setFailed(`❌ Target run concluded "${target.conclusion}" — failing the source run.`);
             }
 
-      - name: Done
+      - name: Download result artifact from target run
         if: success()
-        run: echo "✅ Synchronous trigger completed — target succeeded."
+        id: result
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET: ${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.repo }}
+          RUN_ID: ${{ steps.wait.outputs.run_id }}
+        run: |
+          echo "⬇️  Downloading 'cross-repo-result' artifact from run $RUN_ID"
+          gh run download "$RUN_ID" -R "$TARGET" -n cross-repo-result -D ./_result
+          echo "--- result.json ---"; cat ./_result/result.json
+          CONTAINER_NAME=$(jq -r '.container_name' ./_result/result.json)
+          STATUS=$(jq -r '.status' ./_result/result.json)
+          echo "container_name=$CONTAINER_NAME" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Use the returned container name
+        if: success()
+        run: |
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  Result returned from target receiver     ║"
+          echo "╚══════════════════════════════════════════╝"
+          echo "Status:         ${{ steps.result.outputs.status }}"
+          echo "Container name: ${{ steps.result.outputs.container_name }}"
+          echo ""
+          echo "✅ Synchronous round trip complete — container name received in the triggering run."
