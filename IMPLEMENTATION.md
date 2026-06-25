@@ -5,17 +5,35 @@ repository using a **GitHub App**, with three working patterns:
 
 1. **Async (fire-and-forget)** — source dispatches and exits immediately.
 2. **Async + callback** — target reports success/failure back to the source in a separate run.
-3. **Synchronous** — source dispatches, **waits** for the target to finish, and passes/fails its own run accordingly.
+3. **Synchronous** — source dispatches, **waits** for the target to finish, passes/fails its own run, and can read **data the receiver produced** (e.g. a container name) back into the same run.
 
 Authentication uses the maintained [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token)
 action — no hand-rolled JWTs, no installation ID, no long-lived user tokens.
 
 ---
 
+## ✅ Setup Checklist (do this on BOTH repos)
+
+```
+[ ] 1. Create one GitHub App (owner = the account that owns both repos)
+        - Webhook "Active": OFF      - Subscribe to events: none
+        - Permissions: Contents = Read & write, Actions = Read-only, Metadata = Read-only
+[ ] 2. Note the App's CLIENT ID (Iv23...) and Generate a private key (.pem)
+[ ] 3. Install App → All repositories (or select BOTH source + target)
+[ ] 4. Add secrets to BOTH repos:  APP_CLIENT_ID, APP_PRIVATE_KEY
+[ ] 5. Add workflow files (source/* to source repo, target/* to target repo)
+[ ] 6. Run "Source - Cross-Repo Trigger (Sync)" → confirm it waits + returns data
+```
+
+Full details for each step are below.
+
+---
+
 ## 📋 Prerequisites
 
-- A GitHub account (or organization)
+- A GitHub account (or organization) that owns **both** repositories
 - Two repositories — here: `Onemanwolf/github-app-source-trigger` and `Onemanwolf/github-app-target-receiver`
+- `gh` CLI authenticated as the repos' owner (for the secret-setting commands)
 
 ---
 
@@ -74,9 +92,9 @@ gh secret set APP_PRIVATE_KEY --repo OWNER/REPO < path/to/key.pem
 | Repo | File | Role |
 |------|------|------|
 | source | `source-trigger.yml` | Async fire-and-forget trigger |
-| source | `source-trigger-sync.yml` | Synchronous trigger (waits for target) |
+| source | `source-trigger-sync.yml` | Synchronous trigger — waits for target **and reads back its result artifact** |
 | source | `source-result-receiver.yml` | Receives the async callback from the target |
-| target | `target-receiver.yml` | Receives the dispatch and does the work |
+| target | `target-receiver.yml` | Receives the dispatch, does the work, **uploads a `result.json` artifact** |
 | target | `target-evaluator.yml` | Evaluates the receiver run and sends the callback |
 
 ### Source: `source-trigger.yml` (async)
@@ -258,6 +276,69 @@ Source - Cross-Repo Trigger (Sync)   ← ONE run, blocks the whole time
 
 ---
 
+## 🔄 Passing Data Both Directions
+
+The sync workflow also carries **data down and back up** in the same run.
+
+### Down: trigger → receiver (trivial)
+
+Anything added to `client_payload` is readable in the receiver as
+`${{ github.event.client_payload.<key> }}`. The sync workflow sends a
+`container-name` and `image-tag` input down this way.
+
+> **GitHub limit:** `client_payload` allows at most **10 top-level keys** (≈64 KB total). Nest under one object if you need more.
+
+### Up: receiver → source (via an artifact)
+
+A value the receiver *computes during its run* (e.g. a resolved container name)
+is **not** exposed by the run-status API — only status/conclusion/metadata are.
+So the receiver writes it to an artifact and the source downloads it:
+
+**Receiver** (`target-receiver.yml`) — derive the value, write `result.json`, upload it:
+
+```yaml
+      - name: Resolve container name and write result
+        id: deploy
+        run: |
+          CONTAINER_NAME="${{ github.event.client_payload.container_name }}"
+          IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
+          DEPLOYED_CONTAINER="${CONTAINER_NAME}-${IMAGE_TAG}-run${{ github.run_number }}"
+          cat > "$RUNNER_TEMP/result.json" <<EOF
+          { "status": "deployed", "container_name": "$DEPLOYED_CONTAINER", "image_tag": "$IMAGE_TAG" }
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-repo-result
+          path: ${{ runner.temp }}/result.json
+          retention-days: 1
+```
+
+**Source** (`source-trigger-sync.yml`) — after the target completes, download and parse it
+(`gh run download` auto-unzips; the App token's **Actions: Read** covers artifacts):
+
+```yaml
+      - name: Download result artifact from target run
+        if: success()
+        id: result
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET: ${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.repo }}
+          RUN_ID: ${{ steps.wait.outputs.run_id }}   # run id surfaced by the poll step
+        run: |
+          gh run download "$RUN_ID" -R "$TARGET" -n cross-repo-result -D ./_result
+          echo "container_name=$(jq -r '.container_name' ./_result/result.json)" >> "$GITHUB_OUTPUT"
+```
+
+Downstream steps then use `${{ steps.result.outputs.container_name }}`. Add any
+fields you like to `result.json` and read them back with `jq`.
+
+```
+Sync run:  send container-name DOWN ──▶ receiver "deploys" ──▶ uploads result.json
+           ◀── download artifact ◀── reads container_name back ── all in ONE run
+```
+
+---
+
 ## 🔒 Security Notes
 
 - The private key is stored as an encrypted GitHub Actions secret, never in code.
@@ -279,3 +360,4 @@ Source - Cross-Repo Trigger (Sync)   ← ONE run, blocks the whole time
 | `Input 'app-id' has been deprecated` | Use `client-id: ${{ secrets.APP_CLIENT_ID }}` instead of `app-id` |
 | Node.js 20 deprecation warning | Bump actions: `checkout@v7`, `create-github-app-token@v3`, `github-script@v9` |
 | Sync run times out | Increase `timeout-seconds`, or check the receiver actually ran (correlation id mismatch) |
+| `gh run download` finds no artifact | Receiver must `actions/upload-artifact@v4` with the same name (`cross-repo-result`); artifact exists only after the run completes |
