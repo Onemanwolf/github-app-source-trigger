@@ -1,0 +1,135 @@
+name: Source - Cross-Repo Trigger (Sync)
+
+# Synchronous variant: dispatches the target, then BLOCKS in the same job until
+# the target's receiver run completes. Finishes green on success; fails the run
+# on any non-success conclusion.
+#
+# Requires the GitHub App to have "Actions: Read" permission (to poll target runs)
+# in addition to "Contents: Write" (to send the dispatch).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target-repo:
+        description: 'Target repository (owner/repo)'
+        required: true
+        default: 'Onemanwolf/github-app-target-receiver'
+      message:
+        description: 'Message to include with trigger'
+        required: false
+        default: 'Synchronous trigger'
+      timeout-seconds:
+        description: 'Max seconds to wait for the target run to finish'
+        required: false
+        default: '300'
+
+permissions:
+  contents: read
+
+jobs:
+  trigger-and-wait:
+    runs-on: ubuntu-latest
+    name: Trigger Target and Wait for Result
+
+    steps:
+      - name: Parse target repository
+        id: parse
+        run: |
+          TR="${{ github.event.inputs.target-repo }}"
+          OWNER="${TR%%/*}"
+          REPO="${TR#*/}"
+          if [ -z "$OWNER" ] || [ -z "$REPO" ] || [ "$OWNER" = "$TR" ]; then
+            echo "::error::Invalid target-repo '$TR' (expected owner/repo)"
+            exit 1
+          fi
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"   >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token (scoped to target repo)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ steps.parse.outputs.owner }}
+          repositories: ${{ steps.parse.outputs.repo }}
+
+      - name: Dispatch and wait for completion
+        uses: actions/github-script@v9
+        env:
+          TARGET_OWNER: ${{ steps.parse.outputs.owner }}
+          TARGET_REPO: ${{ steps.parse.outputs.repo }}
+          MESSAGE: ${{ github.event.inputs.message }}
+          TIMEOUT_SECONDS: ${{ github.event.inputs.timeout-seconds }}
+          RECEIVER_WORKFLOW: target-receiver.yml
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const owner = process.env.TARGET_OWNER;
+            const repo = process.env.TARGET_REPO;
+            const timeoutMs = (parseInt(process.env.TIMEOUT_SECONDS, 10) || 300) * 1000;
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+            // Unique correlation id for THIS source run (survives re-runs via attempt).
+            const cid = `${context.runId}-${process.env.GITHUB_RUN_ATTEMPT || '1'}`;
+            const startedAt = Date.now();
+
+            // 1) Fire the dispatch with the correlation id embedded in the payload.
+            await github.rest.repos.createDispatchEvent({
+              owner, repo,
+              event_type: 'cross-repo-trigger',
+              client_payload: {
+                message: process.env.MESSAGE,
+                correlation_id: cid,
+                source_repo: `${context.repo.owner}/${context.repo.repo}`,
+                source_ref: context.ref,
+                triggered_by: context.actor,
+                run_id: context.runId,
+                timestamp: new Date().toISOString(),
+              },
+            });
+            core.info(`📤 Dispatched cross-repo-trigger (cid=${cid}) to ${owner}/${repo}`);
+
+            // 2) Poll until the matching receiver run appears AND completes.
+            core.info('⏳ Waiting for the target receiver run to appear and complete...');
+            const deadline = startedAt + timeoutMs;
+            let target = null;
+
+            while (Date.now() < deadline) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner, repo,
+                workflow_id: process.env.RECEIVER_WORKFLOW,
+                event: 'repository_dispatch',
+                per_page: 30,
+              });
+              const match = runs.data.workflow_runs.find(r =>
+                (r.display_title && r.display_title.includes(cid)) ||
+                (r.name && r.name.includes(cid))
+              );
+              if (match) {
+                core.info(`   Found receiver run #${match.run_number} — status: ${match.status}`);
+                if (match.status === 'completed') { target = match; break; }
+              } else {
+                core.info('   Receiver run not visible yet...');
+              }
+              await sleep(5000);
+            }
+
+            // 3) Decide the outcome of THIS run based on the target's conclusion.
+            if (!target) {
+              core.setFailed(`❌ Timed out after ${timeoutMs / 1000}s waiting for target run (cid=${cid}).`);
+              return;
+            }
+
+            core.info(`🔗 Target run: ${target.html_url}`);
+            core.info(`   Conclusion: ${target.conclusion}`);
+
+            if (target.conclusion === 'success') {
+              core.info('✅ Target completed successfully — source run finishes green.');
+            } else {
+              core.setFailed(`❌ Target run concluded "${target.conclusion}" — failing the source run.`);
+            }
+
+      - name: Done
+        if: success()
+        run: echo "✅ Synchronous trigger completed — target succeeded."
