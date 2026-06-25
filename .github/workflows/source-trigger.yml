@@ -1,0 +1,108 @@
+name: Source - Cross-Repo Trigger
+
+on:
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      target-repo:
+        description: 'Target repository (owner/repo)'
+        required: true
+        default: 'Onemanwolf/github-app-target-receiver'
+      message:
+        description: 'Message to include with trigger'
+        required: false
+        default: 'Triggered from source repo via GitHub App'
+
+permissions:
+  contents: read         # Only needed for actions/checkout; the dispatch uses the App token
+
+jobs:
+  trigger-target:
+    runs-on: ubuntu-latest
+    name: Trigger Target Repository Workflow
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+
+      - name: Generate GitHub App Installation Token
+        id: get-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Trigger Target Repository Workflow
+        id: trigger
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.get-token.outputs.token }}
+          script: |
+            const targetRepo = '${{ github.event.inputs.target-repo }}';
+
+            // Validate: target-repo must be a real owner/repo-name, not a placeholder
+            if (!targetRepo || !targetRepo.includes('/')) {
+              core.setFailed(
+                `Missing or invalid target repository. Please specify owner/repo-name.`
+              );
+              return;
+            }
+
+            const [owner, repo] = targetRepo.split('/');
+
+            // Reject common placeholder patterns
+            const placeholderPatterns = [
+              'your-', 'owner', 'replace', 'example', 'test-', 'demo-',
+              'your-username', 'your-account'
+            ];
+            for (const p of placeholderPatterns) {
+              if (owner.toLowerCase() === p || repo.toLowerCase() === p) {
+                core.setFailed(
+                  `Invalid target repository: "${owner}/${repo}" looks like a placeholder. `
+                  + `Please enter the actual repository path (e.g., my-org/my-target).`
+                );
+                return;
+              }
+            }
+
+            // Reject self-dispatch
+            if (owner === context.repo.owner && repo === context.repo.name) {
+              core.setFailed(
+                `Cannot dispatch to the same repository. `
+                + `Target "${owner}/${repo}" is the source repository. Please specify a different repo.`
+              );
+              return;
+            }
+
+            try {
+              const response = await github.rest.repos.createDispatchEvent({
+                owner: owner,
+                repo: repo,
+                event_type: 'cross-repo-trigger',
+                client_payload: {
+                  message: '${{ github.event.inputs.message }}',
+                  source_repo: context.repo.owner + '/' + context.repo.name,
+                  source_ref: context.ref,
+                  triggered_by: context.actor,
+                  run_id: context.runId,
+                  timestamp: new Date().toISOString(),
+                },
+              });
+
+              core.info(`✅ Dispatched event to ${owner}/${repo}`);
+              core.info(`   Event ID: ${response.id}`);
+              core.setOutput('event_id', response.id);
+            } catch (error) {
+              core.error(`❌ Failed to dispatch: ${error.message}`);
+              core.setFailed(`Dispatch failed: ${error.message}`);
+            }
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  Cross-Repo Trigger Completed!           ║"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
+          echo "✅ Target repository has been notified"
+          echo "📋 Check the target repo's Actions tab"
