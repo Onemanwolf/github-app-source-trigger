@@ -29,7 +29,7 @@ jobs:
         id: get-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.APP_ID }}
+          client-id: ${{ secrets.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           # Without these the token is scoped to ONLY this repo, so the
           # cross-repo dispatch fails with 403 "Resource not accessible by integration".
