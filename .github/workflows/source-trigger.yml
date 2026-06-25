@@ -70,7 +70,7 @@ jobs:
             }
 
             // Reject self-dispatch
-            if (owner === context.repo.owner && repo === context.repo.name) {
+            if (owner === context.repo.owner && repo === context.repo.repo) {
               core.setFailed(
                 `Cannot dispatch to the same repository. `
                 + `Target "${owner}/${repo}" is the source repository. Please specify a different repo.`
@@ -85,7 +85,7 @@ jobs:
                 event_type: 'cross-repo-trigger',
                 client_payload: {
                   message: '${{ github.event.inputs.message }}',
-                  source_repo: context.repo.owner + '/' + context.repo.name,
+                  source_repo: context.repo.owner + '/' + context.repo.repo,
                   source_ref: context.ref,
                   triggered_by: context.actor,
                   run_id: context.runId,
